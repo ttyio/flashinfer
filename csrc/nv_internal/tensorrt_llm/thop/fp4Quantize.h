@@ -25,7 +25,7 @@ namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 std::optional<at::Tensor> globalScale,
                                                 int64_t sfVecSize, bool sfUseUE8M0,
-                                                bool isSfSwizzledLayout);
+                                                bool isSfSwizzledLayout, bool foldingBatchDimToM);
 
 at::Tensor block_scale_interleave(at::Tensor const& unswizzled_sf);
 

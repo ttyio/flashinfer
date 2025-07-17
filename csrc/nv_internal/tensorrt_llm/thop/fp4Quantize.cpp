@@ -40,7 +40,7 @@ namespace torch_ext {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
                                                 std::optional<at::Tensor> globalScale,
                                                 int64_t sfVecSize, bool sfUseUE8M0,
-                                                bool isSfSwizzledLayout) {
+                                                bool isSfSwizzledLayout, bool foldingBatchDimToM) {
   CHECK_TH_CUDA(self);
   CHECK_CONTIGUOUS(self);
   if (sfUseUE8M0) {
@@ -53,10 +53,15 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   auto const& rank = inputShape.size();
 
   TORCH_CHECK(rank >= 2, "Input should be >=2D tensor.");
-  int64_t m = 1;
-  for (size_t i = 0; i < rank - 1; i++) {
-    m *= inputShape[i];
+  int64_t b = 1;
+  if (rank > 2) {
+    for (size_t i = 0; i < rank - 2; i++) {
+      b *= inputShape[i];
+    }
   }
+  int64_t const m = foldingBatchDimToM ? b * inputShape[rank - 2] : inputShape[rank - 2];
+  b = foldingBatchDimToM ? 1 : b;
+
   auto const k = inputShape[rank - 1];
   TORCH_CHECK(k % sfVecSize == 0);
 
@@ -69,7 +74,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
   int64_t SFSize = isSfSwizzledLayout ? tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sfVecSize)
                                       : tensorrt_llm::computeLinearLayoutSFSize(m, k / sfVecSize);
 
-  at::Tensor scaleFP8SF = at::detail::empty_cuda({SFSize}, SF_DTYPE, self.device(),
+  at::Tensor scaleFP8SF = at::detail::empty_cuda({b * SFSize}, SF_DTYPE, self.device(),
                                                  /* stride */ std::nullopt);  // 1D tensor
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
@@ -81,7 +86,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self,
 
 #define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                 \
   tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(                                    \
-      1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
+      b, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
       at::cuda::getCurrentCUDAStream(self.get_device()));

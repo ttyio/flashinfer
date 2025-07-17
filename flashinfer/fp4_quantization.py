@@ -98,6 +98,7 @@ def get_fp4_quantization_sm100_module():
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
+        folding_batch_dim_to_m: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
 
@@ -119,6 +120,7 @@ def get_fp4_quantization_sm100_module():
             sf_vec_size,
             sf_use_ue8m0,
             is_sf_swizzled_layout,
+            folding_batch_dim_to_m,
         )
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
@@ -128,6 +130,7 @@ def get_fp4_quantization_sm100_module():
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
+        folding_batch_dim_to_m: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape
         return (
@@ -226,6 +229,7 @@ def fp4_quantize(
     sf_vec_size: int = 16,
     sf_use_ue8m0: bool = False,
     is_sf_swizzled_layout: bool = True,
+    folding_batch_dim_to_m: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -253,6 +257,16 @@ def fp4_quantize(
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
+    # for column major input, we need to transpose the input
+    is_column_major = input.stride(-2) == 1
+
+    if is_column_major:
+        if folding_batch_dim_to_m:
+            raise NotImplementedError(
+                "folding_batch_dim_to_m is not supported for column major input"
+            )
+        input = input.transpose(-2, -1)
+
     assert input.shape[-1] % sf_vec_size == 0
     x_q, sf = get_fp4_quantization_sm100_module().fp4_quantize_sm100(
         input,
@@ -260,8 +274,24 @@ def fp4_quantize(
         sf_vec_size,
         sf_use_ue8m0,
         is_sf_swizzled_layout,
+        folding_batch_dim_to_m,
     )
-    sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+
+    if is_column_major:
+        x_q = x_q.transpose(-2, -1)
+
+    if folding_batch_dim_to_m:
+        sf = sf.reshape((-1, input.shape[-1] // sf_vec_size))
+    else:
+        if len(input.shape) > 2:
+            b = 1
+            for i in input.shape[:-2]:
+                b *= i
+            sf = sf.reshape((b, -1, input.shape[-1] // sf_vec_size))
+
+        if is_column_major:
+            sf = sf.transpose(-2, -1)
+
     return x_q, sf
 
 
@@ -296,6 +326,7 @@ def e2m1_and_ufp8sf_scale_to_float(
     sf_vec_size: int = 16,
     ufp8_type: int = 1,
     is_sf_swizzled_layout: bool = True,
+    folding_batch_dim_to_m: bool = True,
 ) -> torch.Tensor:
     """Convert E2M1 format tensor and UFP8 scale factors to float tensor.
 
@@ -322,4 +353,5 @@ def e2m1_and_ufp8sf_scale_to_float(
         sf_vec_size,
         ufp8_type,
         is_sf_swizzled_layout,
+        folding_batch_dim_to_m,
     )
