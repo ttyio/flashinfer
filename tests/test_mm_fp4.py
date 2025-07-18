@@ -17,7 +17,7 @@ from flashinfer import (
 @pytest.mark.parametrize("n", [128, 256, 512])
 @pytest.mark.parametrize("k", [128, 256, 512])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("backend", ["trtllm", "cudnn"])
+@pytest.mark.parametrize("backend", ["trtllm", "cudnn", "cutlass"])
 @pytest.mark.parametrize("use_128x4_sf_layout", [False, True])
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
