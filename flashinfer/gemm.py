@@ -150,6 +150,51 @@ def get_gemm_module():
     return _gemm_module
 
 
+def gen_gemm_sm100_module_trtllm_fp4() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_trtllm_fp4"
+    os.makedirs(gen_directory, exist_ok=True)
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_bf16.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_fp16.cu",
+    ]
+
+    return gen_jit_spec(
+        "gemm_sm100_trtllm_fp4",
+        source_paths,
+        extra_cuda_cflags=sm100a_nvcc_flags
+        + [
+            "-DENABLE_BF16",
+            "-DENABLE_FP4",
+        ],
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+        extra_include_paths=[
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal",
+            jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "cutlass_extensions"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "internal_cutlass_kernels"
+            / "include",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "internal_cutlass_kernels",
+        ],
+    )
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)
@@ -228,6 +273,13 @@ def gen_gemm_sm100_module() -> JitSpec:
 @functools.cache
 def get_gemm_sm100_module():
     module = gen_gemm_sm100_module().build_and_load()
+
+    return module
+
+
+@functools.cache
+def get_gemm_sm100_module_trtllm_fp4():
+    module = gen_gemm_sm100_module_trtllm_fp4().build_and_load()
 
     return module
 
@@ -1056,6 +1108,7 @@ def mm_fp4(
     out_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
+    backend: Literal["cudnn", "trtllm"] = "cudnn",
 ) -> torch.Tensor:
     r"""MM FP4
 
@@ -1159,24 +1212,29 @@ def mm_fp4(
         _expand_block_scale_tensor_shape(b_descale, batch)
     )
 
-    # build the fp4 cudnn graph
-    graph = build_cudnn_gemm_block_scale_dequantize_graph(
-        real_a_shape,
-        real_a_stride,
-        real_b_shape,
-        real_b_stride,
-        expanded_a_descale_shape,
-        expanded_a_descale_stride,
-        expanded_b_descale_shape,
-        expanded_b_descale_stride,
-        _get_native_fp4_dtype(),
-        torch.float8_e4m3fn,
-        _torch_data_type_to_cudnn_data_type(out_dtype),
-        block_size,
-    )
+    if backend == "cudnn":
+        # build the fp4 cudnn graph
+        graph = build_cudnn_gemm_block_scale_dequantize_graph(
+            real_a_shape,
+            real_a_stride,
+            real_b_shape,
+            real_b_stride,
+            expanded_a_descale_shape,
+            expanded_a_descale_stride,
+            expanded_b_descale_shape,
+            expanded_b_descale_stride,
+            _get_native_fp4_dtype(),
+            torch.float8_e4m3fn,
+            _torch_data_type_to_cudnn_data_type(out_dtype),
+            block_size,
+        )
 
-    # execute the fp4 cudnn graph
-    execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
+        # execute the fp4 cudnn graph
+        execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
+    elif backend == "trtllm":
+        get_gemm_sm100_module_trtllm_fp4().gemm_sm100_trtllm_fp4.default(
+            a, b, a_descale, b_descale, alpha, out
+        )
     return out
 
 
