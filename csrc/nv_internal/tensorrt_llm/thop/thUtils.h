@@ -24,7 +24,10 @@
 #define CHECK_TH_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CPU(x) TORCH_CHECK(!x.is_cuda(), #x " must be a CPU tensor")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
-
+#define CHECK_GPU_INPUT(x, st) \
+  CHECK_TH_CUDA(x);            \
+  CHECK_CONTIGUOUS(x);         \
+  CHECK_TYPE(x, st)
 #define CHECK_CPU_INPUT(x, st) \
   CHECK_CPU(x);                \
   CHECK_CONTIGUOUS(x);         \

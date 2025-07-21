@@ -159,10 +159,14 @@ def gen_gemm_sm100_module_trtllm_fp4() -> JitSpec:
         jit_env.FLASHINFER_CSRC_DIR
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_fp16.cu",
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/thop/fp4Gemm.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/tllmException.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/logger.cpp",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/stringUtils.cpp",
     ]
 
     return gen_jit_spec(
-        "gemm_sm100_trtllm_fp4",
+        "fp4_gemm",
         source_paths,
         extra_cuda_cflags=sm100a_nvcc_flags
         + [
@@ -192,6 +196,12 @@ def gen_gemm_sm100_module_trtllm_fp4() -> JitSpec:
             / "tensorrt_llm"
             / "kernels"
             / "internal_cutlass_kernels",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "nv_internal"
+            / "tensorrt_llm"
+            / "kernels"
+            / "cutlass_kernels"
+            / "fp4_gemm",
         ],
     )
 
@@ -1233,8 +1243,8 @@ def mm_fp4(
         # execute the fp4 cudnn graph
         execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
     elif backend == "trtllm":
-        get_gemm_sm100_module_trtllm_fp4().gemm_sm100_trtllm_fp4.default(
-            a, b, a_descale, b_descale, alpha, out
+        get_gemm_sm100_module_trtllm_fp4().fp4_gemm.default(
+            a, b.T, a_descale, b_descale.T, alpha, out
         )
     return out
 
