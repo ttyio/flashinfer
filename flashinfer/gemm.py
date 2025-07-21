@@ -158,6 +158,7 @@ def gen_gemm_sm100_module_trtllm_fp4() -> JitSpec:
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_bf16.cu",
         jit_env.FLASHINFER_CSRC_DIR
         / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp4_gemm/fp4_gemm_fp16.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal/tensorrt_llm/thop/fp4Gemm.cpp",
     ]
 
     return gen_jit_spec(
