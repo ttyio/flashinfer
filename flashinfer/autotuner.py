@@ -508,6 +508,7 @@ class AutoTuner:
                     logger.debug(
                         f"[Autotuner]: profiling chosen runner: {runner} {tactic} for {cache_key}"
                     )
+                    print(f"profiling chosen runner: {tactic} for {cache_key}")
 
         # Get the best runner and tactic from cache
         # If no valid tactic is found, the fallback runner and tactic will be used
@@ -557,6 +558,9 @@ class AutoTuner:
         avg_time = start.elapsed_time(end) / self.repeat
         logger.debug(
             f"[Autotuner]: profiling {runner} {tactic}, shapes={[t.size() for t in inputs]}, avg_time {avg_time}"
+        )
+        print(
+            f"profiling tactic {tactic}, shapes={[t.size() for t in inputs]}, avg_time {avg_time}"
         )
 
         return avg_time

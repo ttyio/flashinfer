@@ -19,11 +19,13 @@ import os
 from enum import Enum
 from itertools import product
 from types import SimpleNamespace
-from typing import Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import jinja2
 import torch
 import torch.nn.functional as F
+
+from .autotuner import AutoTuner, TunableRunner, TuningConfig, autotune
 
 CUDNN_AVAILABLE = False
 try:
@@ -288,7 +290,87 @@ def get_gemm_sm100_module():
 def get_gemm_sm100_module_cutlass_fp4():
     module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
 
-    return module
+    class Fp4GemmRunner(TunableRunner):
+        def __init__(self):
+            self._fp4_gemm_runner = module.fp4_gemm
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+        ) -> List[int]:
+            return list(range(module.fp4_gemm_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int,
+        ):
+            a, b, a_descale, b_descale, alpha, out = inputs
+            module.fp4_gemm.default(a, b, a_descale, b_descale, alpha, out, tactic)
+            return out
+
+    @register_custom_op(
+        "flashinfer::fp4_gemm_sm100",
+        mutates_args=(""),
+    )
+    def fp4_gemm_sm100(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_descale: torch.Tensor,
+        b_descale: torch.Tensor,
+        alpha: torch.Tensor,
+        out: torch.Tensor,
+    ):
+        tuner = AutoTuner.get()
+
+        m = a.shape[0]
+        n = b.shape[1]
+        k = a.shape[1]
+
+        def next_positive_power_of_2(x: int) -> int:
+            if x < 1:
+                return 1
+
+            return 1 << (x - 1).bit_length()
+
+        tune_m_list = []
+        tune_m = next_positive_power_of_2(m)
+        while tune_m > 0:
+            tune_m_list.append(tune_m)
+            tune_m //= 2
+
+        tuning_config = TuningConfig(
+            dynamic_tensors=(
+                # input, dim 0, all valid buckets, map m to power of 2 bucket index.
+                (0, 0, (tuple(tune_m_list), next_positive_power_of_2)),
+            ),
+            constraints=(
+                # block_descale_a should be ceil(M / 128) * 128
+                (2, 0, lambda shapes: ((shapes[0][0] + 127) // 128) * 128),
+                # output m should match input m.
+                (5, 0, lambda shapes: shapes[0][0]),
+            ),
+        )
+
+        fp4_runner = Fp4GemmRunner()
+
+        inputs = [a, b, a_descale, b_descale, alpha, out]
+        with autotune():
+            _, tactic = tuner.choose_one(
+                "fp4_gemm_sm100",
+                [fp4_runner],
+                tuning_config,
+                inputs,
+            )
+
+        print(f"tactic: {tactic} is selected for {m}x{n}x{k}")
+
+        fp4_runner(inputs=inputs, tactic=tactic)
+
+    # Register the module
+    return SimpleNamespace(
+        fp4_gemm_sm100=fp4_gemm_sm100,
+    )
 
 
 def gen_gemm_sm90_module() -> JitSpec:
@@ -1286,7 +1368,7 @@ def mm_fp4(
         # execute the fp4 cudnn graph
         execute_cudnn_gemm_fp4_graph(graph, a, b, a_descale, b_descale, alpha, out)
     elif backend == "cutlass":
-        get_gemm_sm100_module_cutlass_fp4().fp4_gemm.default(
+        get_gemm_sm100_module_cutlass_fp4().fp4_gemm_sm100(
             a, b.T, a_descale, b_descale.T, alpha, out
         )
     return out
