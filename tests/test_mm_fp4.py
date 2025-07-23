@@ -28,8 +28,8 @@ def test_mm_fp4(m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning):
     if not use_128x4_sf_layout and backend != "trtllm":
         print("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
         return
-    if auto_tuning and backend != "trtllm":
-        print("Skipping test for non-trtllm fp4 with auto_tuning=True")
+    if auto_tuning and backend == "cudnn":
+        print("Skipping test for cudnn fp4 with auto_tuning=True")
         return
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)

@@ -41,9 +41,15 @@ namespace torch_ext {
 
 namespace {
 
-CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k) {
-  return CutlassGemmConfig(CutlassTileConfigSM100::CtaShape128x256x128B, MainloopScheduleType::AUTO,
-                           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1);
+CutlassGemmConfig getFp4GemmConfig(int64_t m, int64_t n, int64_t k, int64_t tactic) {
+  auto getCutlassFp4GemmConfigs = []() {
+    CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
+    return gemmRunner.getConfigs();
+  };
+  static std::vector<CutlassGemmConfig> globalConfigs = getCutlassFp4GemmConfigs();
+  TORCH_CHECK(tactic >= 0 && tactic < globalConfigs.size(), "tactic must be between 0 and ",
+              globalConfigs.size());
+  return globalConfigs[tactic];
 }
 
 template <typename T>
@@ -53,20 +59,21 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2,
              CutlassGemmConfig const& gemmConfig, at::Tensor workspace_buffer) {
   CutlassFp4GemmRunner<T, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
 
+  int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
+  int64_t const provided_workspace_size =
+      workspace_buffer.numel() * workspace_buffer.element_size();
+
   auto runKernel = [&](void* workspace) {
     gemmRunner.gemm(out.data_ptr(), mat1.const_data_ptr(), mat2.const_data_ptr(),
                     mat1Scale.const_data_ptr(), mat2Scale.const_data_ptr(),
                     globalScale.data_ptr<float>(), m, n, k, batch_count, gemmConfig,
-                    reinterpret_cast<char*>(workspace.data_ptr()), wsBytes,
+                    reinterpret_cast<char*>(workspace), required_workspace_size,
                     at::cuda::getCurrentCUDAStream(mat1.get_device()));
   };
 
-  int64_t const required_workspace_size = gemmRunner.getWorkspaceSize(m, n, k, batch_count);
-  int64_t const provided_workspace_size =
-      workspace_buffer.numel() * workspace_buffer.element_size();
   if (provided_workspace_size < required_workspace_size) {
-    at::Tensor new_workspace =
-        at::detail::empty_cuda({wsBytes}, at::ScalarType::Char, mat1.device(), std::nullopt);
+    at::Tensor new_workspace = at::detail::empty_cuda(
+        {required_workspace_size}, at::ScalarType::Char, mat1.device(), std::nullopt);
 
     runKernel(new_workspace.data_ptr());
   } else {
@@ -92,7 +99,7 @@ constexpr auto SF_DTYPE = at::ScalarType::Byte;       // uint8_t
 // Only W4A4_NVFP4 and W4A8_MXFP4_FP8 are currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
                         at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor out,
-                        at::Tensor workspace_buffer) {
+                        at::Tensor workspace_buffer, int64_t tactic) {
   CHECK_GPU_INPUT(mat1, FLOAT4_E2M1X2);
   CHECK_GPU_INPUT(mat2, FLOAT4_E2M1X2);
 
@@ -128,7 +135,11 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
     C10_THROW_ERROR(NotImplementedError, "mat1 must be a matrix or a batch of matrices");
   }
 
-  auto config = getDefaultGemmConfig(m, n, k);
+  // No heuristic for now, we rely on the autotuner to select the best tactic.
+  if (tactic == -1) {
+    tactic = 0;
+  }
+  auto config = getFp4GemmConfig(m, n, k, tactic);
 
   constexpr int alignment = 32;
   TORCH_CHECK(k % alignment == 0, "Expected k to be divisible by ", alignment,
@@ -167,10 +178,22 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
 
 at::Tensor fp4_gemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
                     at::Tensor const& mat2Scale, at::Tensor const& globalScale, at::Tensor out,
-                    at::Tensor workspace_buffer) {
-  return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer);
+                    at::Tensor workspace_buffer, int64_t tactic) {
+  return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, out, workspace_buffer, tactic);
+}
+
+int64_t fp4_gemm_tactic_num() {
+  auto getCutlassConfigs = []() {
+    CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
+    return gemmRunner.getConfigs();
+  };
+  static int64_t totalTactics = getCutlassConfigs().size();
+  return totalTactics;
 }
 
 }  // namespace torch_ext
 
-TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) { m.def("fp4_gemm", &torch_ext::fp4_gemm); }
+TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
+  m.def("fp4_gemm", &torch_ext::fp4_gemm);
+  m.def("fp4_gemm_tactic_num", &torch_ext::fp4_gemm_tactic_num);
+}

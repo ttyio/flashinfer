@@ -328,7 +328,88 @@ def get_trtllm_gemm_module():
 def get_gemm_sm100_module_cutlass_fp4():
     module = gen_gemm_sm100_module_cutlass_fp4().build_and_load()
 
-    return module
+    class Fp4GemmRunner(TunableRunner):
+        def __init__(self):
+            self._fp4_gemm_runner = module.fp4_gemm
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return list(range(module.fp4_gemm_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int,
+        ):
+            a, b, a_descale, b_descale, alpha, out, workspace_buffer = inputs
+            module.fp4_gemm.default(
+                a, b, a_descale, b_descale, alpha, out, workspace_buffer, tactic
+            )
+            return out
+
+    @register_custom_op(
+        "flashinfer::fp4_gemm_sm100",
+        mutates_args=(""),
+    )
+    def fp4_gemm_sm100(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        a_descale: torch.Tensor,
+        b_descale: torch.Tensor,
+        alpha: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ):
+        tuner = AutoTuner.get()
+
+        m = a.shape[0]
+        n = b.shape[1]
+        k = a.shape[1]
+
+        a_tensor_index = 0
+        a_scale_tensor_index = 2
+        out_tensor_index = 5
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    a_tensor_index,
+                    0,
+                    get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2,
+                ),
+            ),
+            constraint_specs=(
+                ConstraintSpec(
+                    a_scale_tensor_index,
+                    0,
+                    lambda shapes: pad_up(shapes[a_tensor_index][0], 128),
+                ),
+                ConstraintSpec(
+                    out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
+                ),
+            ),
+        )
+
+        fp4_runner = Fp4GemmRunner()
+
+        inputs = [a, b, a_descale, b_descale, alpha, out, workspace_buffer]
+        _, tactic = tuner.choose_one(
+            "fp4_gemm_sm100",
+            [fp4_runner],
+            tuning_config,
+            inputs,
+        )
+
+        fp4_runner(inputs=inputs, tactic=tactic)
+
+    # Register the module
+    return SimpleNamespace(
+        fp4_gemm_sm100=fp4_gemm_sm100,
+    )
 
 
 def gen_gemm_sm90_module() -> JitSpec:
@@ -1366,7 +1447,7 @@ def mm_fp4(
             workspace_buffer=workspace_buffer,
         )
     elif backend == "cutlass":
-        get_gemm_sm100_module_cutlass_fp4().fp4_gemm.default(
+        get_gemm_sm100_module_cutlass_fp4().fp4_gemm_sm100(
             a, b.T, a_descale, b_descale.T, alpha, out, workspace_buffer
         )
     return out
@@ -1590,8 +1671,9 @@ def get_trtllm_fp4_gemm_module():
     setup_cubin_loader(mod.get_library_path())
 
     class TrtllmFp4GemmRunner(TunableRunner):
-        def __init__(self):
+        def __init__(self, use_8x4_sf_layout: bool = True):
             self._fp4_gemm_runner = op.trtllm_gemm
+            self._use_8x4_sf_layout = use_8x4_sf_layout
 
         def get_valid_tactics(
             self,
@@ -1614,12 +1696,13 @@ def get_trtllm_fp4_gemm_module():
                 b_descale,
                 alpha,
                 out,
-                use_8x4_sf_layout,
             ) = inputs
             type_e2m1 = 0
             type_bf16 = 2
             return list(
-                op.trtllm_gemm_tactics(m, n, k, type_e2m1, type_bf16, use_8x4_sf_layout)
+                op.trtllm_gemm_tactics(
+                    m, n, k, type_e2m1, type_bf16, self._use_8x4_sf_layout
+                )
             )
 
         def forward(
@@ -1635,7 +1718,6 @@ def get_trtllm_fp4_gemm_module():
                 b_descale,
                 alpha,
                 out,
-                use_8x4_sf_layout,
             ) = inputs
             op.trtllm_gemm.default(
                 workspace_buffer,
@@ -1645,7 +1727,7 @@ def get_trtllm_fp4_gemm_module():
                 b_descale,
                 alpha,
                 out,
-                use_8x4_sf_layout,
+                self._use_8x4_sf_layout,
                 tactic,
             )
             return out
@@ -1697,7 +1779,7 @@ def get_trtllm_fp4_gemm_module():
             ),
         )
 
-        fp4_runner = TrtllmFp4GemmRunner()
+        fp4_runner = TrtllmFp4GemmRunner(use_8x4_sf_layout)
 
         inputs = [
             workspace_buffer,
@@ -1707,7 +1789,6 @@ def get_trtllm_fp4_gemm_module():
             b_descale,
             alpha,
             out,
-            use_8x4_sf_layout,
         ]
         _, tactic = tuner.choose_one(
             "trtllm_fp4_gemm_8x4" if use_8x4_sf_layout else "trtllm_fp4_gemm_128x4",
