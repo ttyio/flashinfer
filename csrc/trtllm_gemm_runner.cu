@@ -307,7 +307,7 @@ void trtllm_gemm(at::Tensor workspace_buffer, at::Tensor a, at::Tensor b, at::Te
   auto runKernel = [&](void* workspace) {
     runner.run(m, n, k, a.data_ptr(), a_scale.data_ptr(), b.data_ptr(), b_scale.data_ptr(),
                out.data_ptr(), globalScale.has_value() ? globalScale.value().data_ptr() : nullptr,
-               nullptr, workspace, stream, a.device().index(), tactic);
+               nullptr, ge, stream, a.device().index(), tactic);
   };
 
   int64_t const required_workspace_size = runner.getWorkspaceSizeInBytes(m, n, k, tactic);
@@ -347,6 +347,17 @@ std::vector<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_
   return runner.getValidTactics(m, n, k);
 }
 
+std::string trtllm_gemm_get_tactic_name(int64_t tactic) {
+  auto const gemm = gemm::gemm::GemmInterface();
+  auto const configs = gemm.getGemmConfigs();
+
+  if (tactic < 0 || tactic > gemm.getNumGemmConfigs()) {
+    return "Invalid_tactic";
+  }
+
+  return std::string(configs[tactic].mFunctionName);
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -356,4 +367,5 @@ namespace trtllm_cubin_loader {
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_gemm", &flashinfer::trtllm_gemm);
   m.def("trtllm_gemm_tactics", &flashinfer::trtllm_gemm_tactics);
+  m.def("trtllm_gemm_get_tactic_name", &flashinfer::trtllm_gemm_get_tactic_name);
 }
