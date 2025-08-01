@@ -345,6 +345,17 @@ std::vector<int64_t> trtllm_gemm_tactics(int64_t m, int64_t n, int64_t k, int64_
   return runner.getValidTactics(m, n, k);
 }
 
+std::string trtllm_gemm_get_tactic_name(int64_t tactic) {
+  auto const gemm = gemm::gemm::GemmInterface();
+  auto const configs = gemm.getGemmConfigs();
+
+  if (tactic < 0 || tactic > gemm.getNumGemmConfigs()) {
+    return "Invalid_tactic";
+  }
+
+  return std::string(configs[tactic].mFunctionName);
+}
+
 namespace trtllm_cubin_loader {
 #include <flashinfer/cubin_loader.h>
 }
@@ -354,4 +365,5 @@ namespace trtllm_cubin_loader {
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("trtllm_gemm", &flashinfer::trtllm_gemm);
   m.def("trtllm_gemm_tactics", &flashinfer::trtllm_gemm_tactics);
+  m.def("trtllm_gemm_get_tactic_name", &flashinfer::trtllm_gemm_get_tactic_name);
 }

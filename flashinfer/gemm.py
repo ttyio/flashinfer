@@ -391,6 +391,9 @@ def get_gemm_sm100_module_cutlass_fp4():
         a_scale_tensor_index = 2
         out_tensor_index = 5
 
+        def pad_up(x, y):
+            return ((x + y - 1) // y) * y
+
         tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
@@ -421,6 +424,9 @@ def get_gemm_sm100_module_cutlass_fp4():
             tuning_config,
             inputs,
         )
+        # print(
+        #    f"{m}x{n}x{k} selected tactic: {get_trtllm_gemm_module().trtllm_gemm_get_tactic_name(tactic)}"
+        # )
 
         fp4_runner(inputs=inputs, tactic=tactic)
 
@@ -1085,8 +1091,6 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
-        # WAR: the alpha (contains the global scale) is not supported by the cuBLAS backend, need to deselect it.
-        graph.deselect_engines(["eng0"])
         graph.check_support()
         graph.build_plans()
 
@@ -1817,6 +1821,9 @@ def get_trtllm_fp4_gemm_module():
             tuning_config,
             inputs,
         )
+        # print(
+        #    f"{m}x{n}x{k} selected tactic: {get_trtllm_gemm_module().trtllm_gemm_get_tactic_name(tactic)}"
+        # )
 
         fp4_runner(inputs=inputs, tactic=tactic)
 

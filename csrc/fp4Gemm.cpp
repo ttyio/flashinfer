@@ -191,9 +191,67 @@ int64_t fp4_gemm_tactic_num() {
   return totalTactics;
 }
 
+std::string fp4_gemm_get_tactic_name(int64_t tactic) {
+  CutlassFp4GemmRunner<__nv_bfloat16, FP4GemmType::W4A4_NVFP4_NVFP4> gemmRunner;
+
+  if (tactic < 0 || tactic > gemmRunner.getConfigs().size()) {
+    return "Invalid_tactic";
+  }
+
+  std::ostringstream oss;
+  oss << "tile_";
+  switch (gemmRunner.getConfigs()[tactic].tile_config_sm100) {
+    case CutlassTileConfigSM100::CtaShape128x64x128B:
+      oss << "128x64x128B";
+      break;
+    case CutlassTileConfigSM100::CtaShape128x256x128B:
+      oss << "128x256x128B";
+      break;
+    case CutlassTileConfigSM100::CtaShape128x128x256B:
+      oss << "128x128x256B";
+      break;
+    case CutlassTileConfigSM100::CtaShape128x256x256B:
+      oss << "128x256x256B";
+      break;
+    default:
+      break;
+  }
+  oss << "_cluster_";
+  switch (gemmRunner.getConfigs()[tactic].cluster_shape) {
+    case ClusterShape::ClusterShape_1x1x1:
+      oss << "1x1x1";
+      break;
+    case ClusterShape::ClusterShape_2x1x1:
+      oss << "2x1x1";
+      break;
+    case ClusterShape::ClusterShape_1x2x1:
+      oss << "1x2x1";
+      break;
+    case ClusterShape::ClusterShape_2x2x1:
+      oss << "2x2x1";
+      break;
+    case ClusterShape::ClusterShape_1x4x1:
+      oss << "1x4x1";
+      break;
+    case ClusterShape::ClusterShape_4x2x1:
+      oss << "4x2x1";
+      break;
+    case ClusterShape::ClusterShape_2x4x1:
+      oss << "2x4x1";
+      break;
+    case ClusterShape::ClusterShape_4x4x1:
+      oss << "4x4x1";
+      break;
+    default:
+      break;
+  }
+  return oss.str();
+}
+
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gemm", &torch_ext::fp4_gemm);
   m.def("fp4_gemm_tactic_num", &torch_ext::fp4_gemm_tactic_num);
+  m.def("fp4_gemm_get_tactic_name", &torch_ext::fp4_gemm_get_tactic_name);
 }
