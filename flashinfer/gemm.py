@@ -816,6 +816,15 @@ def _check_cudnn_fp4_availability():
         )
 
 
+def _is_cublas_fp4_available_in_cudnn():
+    """Check if cuDNN FP4 support is available in cuDNN."""
+    _check_cudnn_availability()
+
+    # Check cuDNN backend version for FP4 support (requires cudnn_version == 9.11.1 or cudnn_version >= 9.13)
+    backend_version = cudnn.backend_version()
+    return backend_version == 91101 or backend_version >= 91300
+
+
 def _get_native_fp4_dtype():
     """get native fp4 datatype if supported in the torch, otherwise return uint8."""
     if hasattr(torch, "float4_e2m1fn_x2"):
@@ -932,8 +941,8 @@ def build_cudnn_gemm_block_scale_dequantize_graph(
         graph.validate()
         graph.build_operation_graph()
         graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
-        # WAR: the alpha (contains the global scale) is not supported by the cuBLAS backend, need to deselect it.
-        graph.deselect_engines(["eng0"])
+        if not _is_cublas_fp4_available_in_cudnn():
+            graph.deselect_engines(["eng0"])
         graph.check_support()
         graph.build_plans()
 
