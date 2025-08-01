@@ -37,6 +37,7 @@ from .fused_moe.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
 )
+from .jit.cubin_loader import get_cubin
 
 CUDNN_AVAILABLE = False
 try:
@@ -255,6 +256,19 @@ def get_gemm_sm100_module():
 
 
 def trtllm_gemm_gen_module() -> JitSpec:
+    pipeline_hash = "d5ef535635b6483c30c02f7a5df2a589d2cb9706"
+    commit = "c603ed2"
+    gemm_hash = "434a6e1"
+
+    include_path = f"{pipeline_hash}/gemm-{commit}-{gemm_hash}/"
+    header_name = "KernelMetaInfo"
+    header_hash = "50c5627324003c822efbdd1d368b1e569f4f67f4bb0a2fbb7397cd56c6d14c2a"
+    metainfo = get_cubin(
+        f"{include_path}/{header_name}",
+        header_hash,
+        ".h",
+    )
+    assert metainfo, f"{header_name}.h not found"
     return gen_jit_spec(
         "trtllm_gemm",
         [
@@ -265,6 +279,11 @@ def trtllm_gemm_gen_module() -> JitSpec:
             "-DTLLM_ENABLE_CUDA",
         ]
         + sm100a_nvcc_flags,
+        extra_include_paths=[
+            jit_env.FLASHINFER_CACHE_DIR / "cubins" / include_path,
+            jit_env.FLASHINFER_INCLUDE_DIR
+            / "flashinfer/trtllm/gemm/trtllmGen_gemm_export",
+        ],
         extra_ldflags=["-lcuda"],
     )
 

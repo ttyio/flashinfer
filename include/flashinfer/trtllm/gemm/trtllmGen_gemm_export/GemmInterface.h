@@ -25,6 +25,7 @@
 
 #ifdef TLLM_GEN_EXPORT_INTERFACE
 #include "KernelMetaInfo.h"
+#define TLLM_GEN_GEMM_CONFIG_HASH "434a6e1"
 #endif  // TLLM_GEN_EXPORT_INTERFACE
 
 namespace flashinfer::trtllm_cubin_loader {
@@ -457,7 +458,7 @@ int32_t GemmInterface::run(GemmConfig const& config, void* workspace, GemmData c
 
   auto fiModuleLoadData = [&](CUmodule* module) {
     const std::string sha256 = config.mHash ? config.mHash : "";
-    const std::string pipeline_hash = "fffd607babb0844f24225997409747ca38229333";
+    const std::string pipeline_hash = "d5ef535635b6483c30c02f7a5df2a589d2cb9706";
     const std::string cubin_path = pipeline_hash + "/" + std::string("gemm-") + TLLM_GEN_COMMIT +
                                    "-" + TLLM_GEN_GEMM_CONFIG_HASH + "/";
     std::string fname_cubin = config.mFunctionName;
