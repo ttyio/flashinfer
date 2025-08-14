@@ -91,20 +91,20 @@ def get_gemm_module():
         class CublasFp8GemmRunner(TunableRunner):
             def get_valid_tactics(
                 self,
-                inputs: List[torch.Tensor],
+                inputs: List[Optional[torch.Tensor]],
                 profile: OptimizationProfile,
             ) -> List[int]:
                 return [0]
 
             def forward(
                 self,
-                inputs: List[torch.Tensor],
+                inputs: List[Optional[torch.Tensor]],
                 *,
                 tactic: int = -1,
                 do_preparation: bool = False,
             ) -> torch.Tensor:
                 cublas_handle = torch.cuda.current_blas_handle()
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                a, b, scale_a, scale_b, scale_ab, out, workspace_buffer = inputs
                 module.bmm_fp8.default(
                     a, b, out, scale_a, scale_b, workspace_buffer, cublas_handle
                 )
@@ -389,23 +389,26 @@ def get_gemm_sm100_module_cutlass_fp8():
         class CutlassFp8GemmRunner(TunableRunner):
             def get_valid_tactics(
                 self,
-                inputs: List[torch.Tensor],
+                inputs: List[Optional[torch.Tensor]],
                 profile: OptimizationProfile,
             ) -> List[int]:
                 return list(range(module.fp8_gemm_tactic_num()))
 
             def forward(
                 self,
-                inputs: List[torch.Tensor],
+                inputs: List[Optional[torch.Tensor]],
                 *,
                 tactic: int = -1,
                 do_preparation: bool = False,
             ) -> torch.Tensor:
-                a, b, scale_a, scale_b, out, workspace_buffer = inputs
+                a, b, scale_a, scale_b, scale_ab, out, workspace_buffer = inputs
+                if scale_ab is None:
+                    scale_ab = scale_a * scale_b
+
                 module.fp8_gemm.default(
                     a,
                     b.transpose(-2, -1),
-                    scale_a * scale_b,
+                    scale_ab,
                     out,
                     workspace_buffer,
                     tactic,
@@ -425,6 +428,7 @@ def fp8_gemm_sm100(
     b: torch.Tensor,
     scale_a: torch.Tensor,
     scale_b: torch.Tensor,
+    scale_ab: Optional[torch.Tensor],
     out: torch.Tensor,
     workspace_buffer: torch.Tensor,
     runner_names: List[str],
@@ -441,7 +445,7 @@ def fp8_gemm_sm100(
 
     tuner = AutoTuner.get()
     a_tensor_index = 0
-    out_tensor_index = 4
+    out_tensor_index = 5
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
@@ -458,7 +462,7 @@ def fp8_gemm_sm100(
         ),
     )
 
-    inputs = [a, b, scale_a, scale_b, out, workspace_buffer]
+    inputs = [a, b, scale_a, scale_b, scale_ab, out, workspace_buffer]
     runner, tactic = tuner.choose_one(
         "fp8_gemm",
         runners,
@@ -1410,19 +1414,19 @@ def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
         def get_valid_tactics(
             self,
-            inputs: List[torch.Tensor],
+            inputs: List[Optional[torch.Tensor]],
             profile: OptimizationProfile,
         ) -> List[int]:
             return [0]
 
         def forward(
             self,
-            inputs: List[torch.Tensor],
+            inputs: List[Optional[torch.Tensor]],
             *,
             tactic: int = -1,
             do_preparation: bool = False,
         ) -> torch.Tensor:
-            a, b, scale_a, scale_b, out, workspace_buffer = inputs
+            a, b, scale_a, scale_b, scale_ab, out, workspace_buffer = inputs
             _cudnn_gemm_fp8(workspace_buffer, a, b, scale_a, scale_b, out, out.dtype)
             return out
 
@@ -1676,6 +1680,7 @@ def bmm_fp8(
     dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
     backend: Literal["cudnn", "cublas", "cutlass", "auto"] = "cublas",
+    AB_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""BMM FP8
 
@@ -1701,6 +1706,11 @@ def bmm_fp8(
 
     backend: Literal["cudnn", "cublas", "cutlass", "auto"]
         The backend to use for the operation. Defaults to ``"cublas"``.
+        ``"auto"`` allows autotuning to select the best tactic across all backends.
+
+    AB_scale: Optional[torch.Tensor]
+        Combined scale tensor for A and B, float.
+        If provided, will use this scale tensor when it is faster than using ``A_scale`` and ``B_scale`` separately.
 
     Returns
     -------
@@ -1757,7 +1767,7 @@ def bmm_fp8(
     else:
         raise ValueError(f"Unsupported backend: {backend}")
 
-    fp8_gemm_sm100(A, B, A_scale, B_scale, out, workspace_buffer, backends)
+    fp8_gemm_sm100(A, B, A_scale, B_scale, AB_scale, out, workspace_buffer, backends)
     return out
 
 
