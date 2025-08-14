@@ -23,7 +23,8 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("backend", ["cudnn", "cublas", "cutlass", "auto"])
 @pytest.mark.parametrize("auto_tuning", [True, False])
-def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning):
+@pytest.mark.parametrize("combined_scale", [True, False])
+def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_tuning, combined_scale):
     if input_dtype == torch.float8_e5m2 and mat2_dtype == torch.float8_e5m2:
         pytest.skip("Invalid combination: both input and mat2 are e5m2")
     if input_dtype == torch.float8_e5m2 or mat2_dtype == torch.float8_e5m2:
@@ -42,6 +43,11 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
 
     res = torch.empty([b, m, n], device="cuda", dtype=res_dtype)
 
+    if combined_scale:
+        combined_inv_s = input_inv_s * mat2_inv_s
+    else:
+        combined_inv_s = None
+
     with autotune(auto_tuning):
         bmm_fp8(
             input_fp8,
@@ -51,6 +57,7 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
             res_dtype,
             res,
             backend=backend,
+            AB_scale=combined_inv_s,
         )
 
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
