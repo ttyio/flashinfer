@@ -327,6 +327,31 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
     )
 
 
+def gen_small_gemm_fused_sigmoid_bias_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_small_gemm"
+    os.makedirs(gen_directory, exist_ok=True)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11, 12]
+    )
+
+    return gen_jit_spec(
+        "small_gemm",
+        [jit_env.FLASHINFER_CSRC_DIR / "small_gemm_fused_sigmoid_bias.cu"],
+        extra_cuda_cflags=nvcc_flags,
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
+@functools.cache
+def get_small_gemm_fused_sigmoid_bias_module():
+    mod = gen_small_gemm_fused_sigmoid_bias_module().build_and_load()
+    return mod
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)
@@ -1798,6 +1823,89 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
         )
 
     return (tuple(block_scale_shape), tuple(block_scale_stride))
+
+
+def gemm_fused_sigmoid_bias(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    out_dtype: torch.dtype = torch.bfloat16,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused Sigmoid and Bias for GEMM
+
+    Parameters
+    ----------
+    a: torch.Tensor
+        Input tensor, shape (m, k), bf16.
+
+    b: torch.Tensor
+        Input tensor, shape (k, n), bf16.
+
+    bias: torch.Tensor
+        Bias tensor, shape (n,), bf16.
+
+    out_dtype: torch.dtype
+        Output dtype, bf16.
+
+    out: Optional[torch.Tensor]
+        Out tensor, shape (m, n), bf16, defaults to ``None``.
+
+    Returns
+    -------
+    out: torch.Tensor
+        Out tensor, shape (m, n), bf16.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from flashinfer import gemm_fused_sigmoid_bias
+    >>> a = torch.randn([48, 128], device="cuda", dtype=torch.bfloat16)
+    >>> b = torch.randn([256, 128], device="cuda", dtype=torch.bfloat16)
+    >>> bias = torch.randn([256], device="cuda", dtype=torch.bfloat16)
+    >>> out = gemm_fused_sigmoid_bias(a, b, bias, torch.bfloat16)
+    >>> out.shape
+    torch.Size([48, 256])
+    >>> out.dtype
+    torch.bfloat16
+    """
+    if a.dtype not in {torch.bfloat16}:
+        raise ValueError(
+            f"Unsupported input dtype: {a.dtype}. Only bf16 are supported for fused sigmoid bias."
+        )
+    if b.dtype not in {torch.bfloat16}:
+        raise ValueError(
+            f"Unsupported input dtype: {b.dtype}. Only bf16 are supported for fused sigmoid bias."
+        )
+    if bias.dtype not in {torch.bfloat16}:
+        raise ValueError(
+            f"Unsupported bias dtype: {bias.dtype}. Only bf16 are supported for fused sigmoid bias."
+        )
+    if out_dtype not in {torch.bfloat16}:
+        raise ValueError(
+            f"Unsupported output dtype: {out_dtype}. Only bf16 are supported for fused sigmoid bias."
+        )
+
+    if out is None:
+        out = torch.empty(
+            (a.shape[0], b.shape[1]),
+            device=a.device,
+            dtype=out_dtype,
+        )
+
+    workspace_buffer = _get_cache_buf(
+        "fused_sigmoid_bias_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+
+    get_small_gemm_fused_sigmoid_bias_module().small_gemm_fused_sigmoid_bias(
+        a,
+        b.T,
+        bias,
+        out,
+        workspace_buffer,
+    )
+
+    return out
 
 
 def mm_fp4(
