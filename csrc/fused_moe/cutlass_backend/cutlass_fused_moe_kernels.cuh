@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cooperative_groups.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <float.h>
@@ -803,6 +804,146 @@ void mergeExpertPrefixSum(int const* blocked_expert_counts, int const* blocked_e
                      unpermuted_row_to_permuted_row, num_tokens);
 }
 
+namespace cg = cooperative_groups;
+
+template <int kNumTokensPerBlock>
+__global__ void fusedBlockGlobalMergeKernel(
+    int const* token_selected_experts, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+    int64_t* expert_first_token_offset, int* blocked_expert_counts,
+    int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
+    int64_t const num_experts_per_token, int64_t const num_blocks_per_seq,
+    int const start_expert_id) {
+  using BlockScan = cub::BlockScan<int, kNumTokensPerBlock>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
+  auto grid = cg::this_grid();
+
+  int const target_expert_id = blockIdx.x;
+  int const block_id = blockIdx.y;
+  int const token_id = block_id * kNumTokensPerBlock + threadIdx.x;
+
+  int expanded_token_id = -1;
+  if (token_id < num_tokens) {
+    for (int i = 0; i < num_experts_per_token; i++) {
+      int const expert_id =
+          token_selected_experts[token_id * num_experts_per_token + i] - start_expert_id;
+      if (expert_id == target_expert_id) {
+        expanded_token_id = i * num_tokens + token_id;
+        break;
+      }
+    }
+  }
+
+  int const has_matched = expanded_token_id >= 0 ? 1 : 0;
+  int index;
+  BlockScan(temp_storage).ExclusiveSum(has_matched, index);
+
+  if (has_matched) {
+    blocked_row_to_unpermuted_row[target_expert_id * num_tokens + block_id * kNumTokensPerBlock +
+                                  index] = expanded_token_id;
+  }
+  if (threadIdx.x == kNumTokensPerBlock - 1) {
+    blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id] = index + has_matched;
+  }
+
+  grid.sync();
+
+  if (blockIdx.x == 0 && blockIdx.y == 0) {
+    if (threadIdx.x == 0) {
+      int64_t const num_elements = gridDim.x * num_blocks_per_seq;
+      int cumsum = 0;
+      for (int64_t i = 0; i < num_elements; i++) {
+        blocked_expert_counts_cumsum[i] = cumsum;
+        if ((i % num_blocks_per_seq) == 0) {
+          expert_first_token_offset[i / num_blocks_per_seq] = cumsum;
+        }
+        cumsum += blocked_expert_counts[i];
+      }
+      expert_first_token_offset[gridDim.x] = cumsum;
+    }
+  }
+
+  grid.sync();
+
+  int const cnt = blocked_expert_counts[target_expert_id * num_blocks_per_seq + block_id];
+  int const offset = blocked_expert_counts_cumsum[target_expert_id * num_blocks_per_seq + block_id];
+  if (threadIdx.x < cnt) {
+    int const unpermuted_row =
+        blocked_row_to_unpermuted_row[target_expert_id * num_tokens +
+                                      block_id * kNumTokensPerBlock + threadIdx.x];
+    int const permuted_row = offset + threadIdx.x;
+    permuted_row_to_unpermuted_row[permuted_row] = unpermuted_row;
+    permuted_token_selected_experts[permuted_row] = target_expert_id;
+    unpermuted_row_to_permuted_row[unpermuted_row] = permuted_row;
+  }
+}
+
+bool fusedThreeStepBuildExpertMapsSortFirstToken(
+    int const* token_selected_experts, int* permuted_token_selected_experts,
+    int* permuted_row_to_unpermuted_row, int* unpermuted_row_to_permuted_row,
+    int64_t* expert_first_token_offset, int* blocked_expert_counts,
+    int* blocked_expert_counts_cumsum, int* blocked_row_to_unpermuted_row, int64_t const num_tokens,
+    int64_t const num_experts_per_node, int64_t const num_experts_per_token,
+    int64_t const num_tokens_per_block, int64_t const num_blocks_per_seq, int const start_expert_id,
+    cudaStream_t stream) {
+  int device = 0;
+  int coop = 0;
+  check_cuda_error(cudaGetDevice(&device));
+  check_cuda_error(cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, device));
+  if (!coop) {
+    return false;
+  }
+
+  dim3 const blocks(num_experts_per_node, num_blocks_per_seq);
+  dim3 const threads(num_tokens_per_block);
+
+  void* args[] = {(void*)&token_selected_experts,
+                  (void*)&permuted_token_selected_experts,
+                  (void*)&permuted_row_to_unpermuted_row,
+                  (void*)&unpermuted_row_to_permuted_row,
+                  (void*)&expert_first_token_offset,
+                  (void*)&blocked_expert_counts,
+                  (void*)&blocked_expert_counts_cumsum,
+                  (void*)&blocked_row_to_unpermuted_row,
+                  (void*)&num_tokens,
+                  (void*)&num_experts_per_token,
+                  (void*)&num_blocks_per_seq,
+                  (void*)&start_expert_id};
+
+  int numSms = 0;
+  check_cuda_error(cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device));
+
+  auto launch = [&](auto kernel) -> bool {
+    int maxActive = 0;
+    check_cuda_error(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActive, kernel, threads.x, 0));
+    long long totalActive = (long long)maxActive * (long long)numSms;
+    long long gridTotal = (long long)blocks.x * (long long)blocks.y;
+    if (gridTotal > totalActive) {
+      return false;
+    }
+    auto err = cudaLaunchCooperativeKernel((void*)kernel, blocks, threads, args, 0, stream);
+    if (err != cudaSuccess) {
+      return false;
+    }
+    return true;
+  };
+
+  if (num_tokens_per_block <= 32) {
+    return launch(fusedBlockGlobalMergeKernel<32>);
+  } else if (num_tokens_per_block <= 64) {
+    return launch(fusedBlockGlobalMergeKernel<64>);
+  } else if (num_tokens_per_block <= 128) {
+    return launch(fusedBlockGlobalMergeKernel<128>);
+  } else if (num_tokens_per_block <= 256) {
+    return launch(fusedBlockGlobalMergeKernel<256>);
+  } else if (num_tokens_per_block <= 512) {
+    return launch(fusedBlockGlobalMergeKernel<512>);
+  } else {
+    return launch(fusedBlockGlobalMergeKernel<1024>);
+  }
+}
+
 // threeStepBuildExpertMapsSortFirstToken uses three kernels to achieve the sort of
 // token_selected_experts
 
@@ -843,6 +984,15 @@ void threeStepBuildExpertMapsSortFirstToken(
   int64_t const num_tokens_per_block = computeNumTokensPerBlock(num_tokens, num_experts_per_node);
   int64_t const num_blocks_per_seq =
       tensorrt_llm::common::ceilDiv(num_tokens, num_tokens_per_block);
+
+  if (fusedThreeStepBuildExpertMapsSortFirstToken(
+          token_selected_experts, permuted_token_selected_experts, permuted_row_to_unpermuted_row,
+          unpermuted_row_to_permuted_row, expert_first_token_offset, blocked_expert_counts,
+          blocked_expert_counts_cumsum, blocked_row_to_unpermuted_row, num_tokens,
+          num_experts_per_node, num_experts_per_token, num_tokens_per_block, num_blocks_per_seq,
+          start_expert_id, stream)) {
+    return;
+  }
 
   blockExpertPrefixSum(token_selected_experts, blocked_expert_counts, blocked_row_to_unpermuted_row,
                        num_tokens, num_experts_per_node, num_experts_per_token,
@@ -3786,6 +3936,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     sync_check_cuda_error(stream);
   } else {
     bool fused_prologue_result = false;
+    /*
     if (!use_w4_groupwise) {
       // WAR: fusedBuildExpertMapsSortFirstToken kernel will lead to illegal memory access for
       // W4AFP8
@@ -3793,7 +3944,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
           token_selected_experts, permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row,
           expert_first_token_offset_, num_rows, num_experts_per_node, experts_per_token,
           start_expert, end_expert, enable_pdl, stream);
-    }
+    }*/
 
     if (!fused_prologue_result) {
       TLLM_LOG_TRACE("Falling back to unfused prologue");
