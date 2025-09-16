@@ -195,6 +195,44 @@ def get_comm_alltoall_module():
         return module.get_moe_prepare_workspace_size_per_rank(ep_size)
 
     @register_custom_op(
+        "flashinfer::moe_prepare_fused",
+        mutates_args=[],
+    )
+    def moe_prepare_fused(
+        experts_ids: torch.Tensor,
+        scales: Optional[torch.Tensor],
+        experts_statics: Optional[torch.Tensor],
+        workspace: torch.Tensor,
+        max_token_count_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        expert_count: int,
+        slot_count: int,
+        top_k: int,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        return module.moe_prepare_fused(
+            experts_ids,
+            scales,
+            experts_statics,
+            workspace,
+            max_token_count_per_rank,
+            ep_rank,
+            ep_size,
+            expert_count,
+            slot_count,
+            top_k,
+        )
+
+    @register_custom_op(
         "flashinfer::moe_prepare",
         mutates_args=[],
     )
@@ -240,6 +278,7 @@ def get_comm_alltoall_module():
         get_moe_commworkspace_size_per_rank=get_moe_commworkspace_size_per_rank,
         get_moe_prepare_workspace_size_per_rank=get_moe_prepare_workspace_size_per_rank,
         moe_prepare=moe_prepare,
+        moe_prepare_fused=moe_prepare_fused,
     )
 
 
@@ -357,6 +396,41 @@ def moe_prepare(
     torch.Tensor,
 ]:
     return get_comm_alltoall_module().moe_prepare(
+        experts_ids,
+        scales,
+        experts_statics,
+        workspace,
+        max_token_count_per_rank,
+        ep_rank,
+        ep_size,
+        expert_count,
+        slot_count,
+        top_k,
+    )
+
+
+def moe_prepare_fused(
+    experts_ids: torch.Tensor,
+    scales: Optional[torch.Tensor],
+    experts_statics: Optional[torch.Tensor],
+    workspace: torch.Tensor,
+    max_token_count_per_rank: int,
+    ep_rank: int,
+    ep_size: int,
+    expert_count: int,
+    slot_count: int,
+    top_k: int,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return get_comm_alltoall_module().moe_prepare_fused(
         experts_ids,
         scales,
         experts_statics,

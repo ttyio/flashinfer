@@ -703,7 +703,7 @@ def test_moe_alltoall_prepare(
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        tllm_alltoall.moe_prepare(
+        tllm_alltoall.moe_prepare_fused(
             expert_ids_all_ranks[0],
             scales_all_ranks[0],
             experter_count_lists[0],
@@ -788,7 +788,7 @@ def test_moe_alltoall_prepare(
                     local_recv_rank_indices,
                     backward_local_recv_rank_indices,
                     gathered_expert_statics,
-                ) = tllm_alltoall.moe_prepare(
+                ) = tllm_alltoall.moe_prepare_fused(
                     expert_ids_all_ranks[rank],
                     scales_all_ranks[rank],
                     experter_count_lists[rank],
@@ -801,7 +801,7 @@ def test_moe_alltoall_prepare(
                     top_k,
                 )
             else:
-                tllm_alltoall.moe_prepare(
+                tllm_alltoall.moe_prepare_fused(
                     expert_ids_all_ranks[rank],
                     scales_all_ranks[rank],
                     experter_count_lists[rank],

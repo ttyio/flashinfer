@@ -510,6 +510,78 @@ __global__ void allToAllMetadataDevice(int* sendExperts, int* recvExperts, float
   }
 }
 
+__global__ void fusedCumsumAndMoveIndiceCoop(int* sendCountsCumsum, int* recvCountsCumsum,
+                                             int* sendIndice, int* gatherSendIndice,
+                                             int* backwardIndice, int* gatherBackwardIndice,
+                                             int* recvIndice, int* gatherRecvIndice, int rankCount,
+                                             int maxTokenCountPerRank) {
+  namespace cgx = cooperative_groups;
+  cgx::grid_group grid = cgx::this_grid();
+  if (blockIdx.x == 0 && blockIdx.y == 0) {
+    typedef cub::BlockScan<int, CUMSUM_THREADS_PER_BLOCK> BlockScan;
+    __shared__ typename BlockScan::TempStorage ts;
+    int tid = threadIdx.x;
+    int v = tid < rankCount ? sendCountsCumsum[tid] : 0;
+    BlockScan(ts).InclusiveSum(v, v);
+    if (tid < rankCount) sendCountsCumsum[tid] = v;
+    __syncthreads();
+    v = tid < rankCount ? recvCountsCumsum[tid] : 0;
+    BlockScan(ts).InclusiveSum(v, v);
+    if (tid < rankCount) recvCountsCumsum[tid] = v;
+  }
+  grid.sync();
+  if (blockIdx.x >= (unsigned)rankCount) return;
+  int r = blockIdx.x;
+  if (blockIdx.y == 0) {
+    int s = r == 0 ? 0 : sendCountsCumsum[r - 1];
+    int e = sendCountsCumsum[r];
+    int c = e - s;
+    int* ls = sendIndice + r * maxTokenCountPerRank;
+    int* lb = backwardIndice + r * maxTokenCountPerRank;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+      gatherSendIndice[s + i] = ls[i];
+      gatherBackwardIndice[s + i] = lb[i];
+    }
+  } else {
+    int s = r == 0 ? 0 : recvCountsCumsum[r - 1];
+    int e = recvCountsCumsum[r];
+    int c = e - s;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+      gatherRecvIndice[s + i] = s + i;
+    }
+  }
+}
+
+void computeCumsumAndMoveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice,
+                                int* gatherSendIndice, int* backwardIndice,
+                                int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice,
+                                int rankId, int rankCount, int maxTokenCountPerRank,
+                                cudaStream_t stream) {
+  int device = 0;
+  cudaGetDevice(&device);
+  int coop = 0;
+  cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, device);
+  if (coop) {
+    dim3 block(CUMSUM_THREADS_PER_BLOCK);
+    dim3 grid(rankCount, 2);
+    void* args[] = {&sendCountsCumsum, &recvCountsCumsum,     &sendIndice, &gatherSendIndice,
+                    &backwardIndice,   &gatherBackwardIndice, &recvIndice, &gatherRecvIndice,
+                    &rankCount,        &maxTokenCountPerRank};
+    cudaLaunchCooperativeKernel((void*)fusedCumsumAndMoveIndiceCoop, grid, block, args, 0, stream);
+  } else {
+    int block_size = CUMSUM_THREADS_PER_BLOCK;
+    dim3 block(block_size);
+    dim3 grid2(2);
+    computeCumsumDevice<<<grid2, block, 0, stream>>>(sendCountsCumsum, recvCountsCumsum, rankId,
+                                                     rankCount);
+    dim3 block3(512);
+    dim3 grid3(rankCount, 2);
+    moveIndiceDevice<<<grid3, block3, 0, stream>>>(
+        sendCountsCumsum, recvCountsCumsum, sendIndice, gatherSendIndice, backwardIndice,
+        gatherBackwardIndice, recvIndice, gatherRecvIndice, maxTokenCountPerRank);
+  }
+}
+
 __global__ void memsetExpertIdsDevice(int* expertIds, int* recvCountsCumsum,
                                       int maxTokenCountPerRank, int topK, int slotCount,
                                       int rankCount) {

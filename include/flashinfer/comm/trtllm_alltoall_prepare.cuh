@@ -114,6 +114,12 @@ void moveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice,
                 int* recvIndice, int* gatherRecvIndice, int rankId, int rankCount,
                 int maxTokenCountPerRank, cudaStream_t stream);
 
+void computeCumsumAndMoveIndice(int* sendCountsCumsum, int* recvCountsCumsum, int* sendIndice,
+                                int* gatherSendIndice, int* backwardIndice,
+                                int* gatherBackwardIndice, int* recvIndice, int* gatherRecvIndice,
+                                int rankId, int rankCount, int maxTokenCountPerRank,
+                                cudaStream_t stream);
+
 void allToAllMetadata(int* sendExperts, int* recvExperts, float* sendScales, float* recvScales,
                       int* localExpertStatics, int* gatheredExpertStatics,
                       MoeCommWorkspace workspace, int* sendCountsCumsum, int* localSendIndice,
