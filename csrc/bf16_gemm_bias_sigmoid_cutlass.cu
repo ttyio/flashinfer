@@ -73,14 +73,26 @@ struct DeviceBf16GemmSigmodBias {
 
   using EpilogSchedule = typename SMTypeAdapter<XSM_>::EpilogueSchedule;
   using MainloopSchedule = typename SMTypeAdapter<XSM_>::MainloopSchedule;
-  using FusionOp = cutlass::epilogue::fusion::PerColResAddPerColBiasEltAct<
-      cutlass::epilogue::thread::Sigmoid, ElementD, ElementAccumulator, ElementD, ElementC,
-      ElementAccumulator>;
+
+  using CustomEVT = cutlass::epilogue::fusion::Sm90EVT<
+      cutlass::epilogue::fusion::Sm90Compute<
+          cutlass::plus, ElementD, ElementAccumulator,
+          cutlass::FloatRoundStyle::round_to_nearest>,  // bias + sigmoid(acc)
+      cutlass::epilogue::fusion::Sm90RowBroadcast<0, MmaTileShape, ElementD, ElementAccumulator,
+                                                  cute::Stride<cute::_0, cute::_1, int64_t>,
+                                                  AlignmentD>,  // per-column bias
+      cutlass::epilogue::fusion::Sm90EVT<
+          cutlass::epilogue::fusion::Sm90Compute<
+              cutlass::epilogue::thread::Sigmoid, ElementAccumulator, ElementAccumulator,
+              cutlass::FloatRoundStyle::round_to_nearest>,  // sigmoid(acc)
+          cutlass::epilogue::fusion::Sm90AccFetch           // acc
+          >>;
+
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, MmaTileShape, ClusterShape,
       cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
       ElementC, LayoutC, AlignmentC, ElementD, LayoutC, AlignmentD, EpilogSchedule,
-      FusionOp>::CollectiveOp;
+      CustomEVT>::CollectiveOp;
   using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag, OperatorClass, ElementA, LayoutA, AlignmentA, ElementB, LayoutB, AlignmentB,
       ElementAccumulator, MmaTileShape, ClusterShape,
@@ -102,10 +114,10 @@ typename GemmT::Arguments prepareBf16GemmSigmoidBiasArgs(void const* A, void con
   using FusionCallbacksT = typename CollectiveEpilogueT::FusionCallbacks;
   using EpilogueArgsT = typename FusionCallbacksT::Arguments;
   using ElementCompute = float;
-  EpilogueArgsT epi{};
-  epi.alpha = ElementCompute(1.F);
-  epi.beta = ElementCompute(0.F);
-  epi.bias_ptr = static_cast<cutlass::bfloat16_t const*>(bias);
+  EpilogueArgsT epi{{static_cast<cutlass::bfloat16_t const*>(bias), cutlass::bfloat16_t(0),
+                     cute::Stride<cute::_0, cute::_1, int64_t>{}},
+                    {{}, {}},
+                    {}};
   using StrideAT = typename GemmT::GemmKernel::StrideA;
   using StrideBT = typename GemmT::GemmKernel::StrideB;
   using StrideCT = typename GemmT::GemmKernel::StrideC;
@@ -185,7 +197,7 @@ at::Tensor small_gemm_fused_sigmoid_bias_impl(at::Tensor const& A, at::Tensor co
       nullptr, 0, stream);
 
   auto runKernel = [&](void* workspace) {
-    genericBf16GemmSigmoidBiasLauncher<64, 256, 128, 1, 1, 1, _1SM>(
+    genericBf16GemmSigmoidBiasLauncher<128, 64, 128, 2, 1, 1, _2SM>(
         A.const_data_ptr(), B.const_data_ptr(), out.data_ptr(), bias.const_data_ptr(), M, N, K,
         workspace, required_workspace_size, stream);
   };
