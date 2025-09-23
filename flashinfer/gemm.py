@@ -352,6 +352,31 @@ def get_small_gemm_fused_sigmoid_bias_module():
     return mod
 
 
+def gen_small_gemm_fused_sigmoid_bias_cutlass_module() -> JitSpec:
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_small_gemm"
+    os.makedirs(gen_directory, exist_ok=True)
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10, 11]
+    )
+
+    return gen_jit_spec(
+        "small_gemm_fused_sigmoid_bias_cutlass",
+        [jit_env.FLASHINFER_CSRC_DIR / "bf16_gemm_bias_sigmoid_cutlass.cu"],
+        extra_cuda_cflags=nvcc_flags,
+        extra_cflags=[
+            "-DFAST_BUILD",
+        ],
+        extra_ldflags=["-lcuda"],
+    )
+
+
+@functools.cache
+def get_small_gemm_fused_sigmoid_bias_cutlass_module():
+    mod = gen_small_gemm_fused_sigmoid_bias_cutlass_module().build_and_load()
+    return mod
+
+
 def gen_gemm_sm100_module() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100"
     os.makedirs(gen_directory, exist_ok=True)
@@ -1386,7 +1411,8 @@ class UIDs(Enum):
     BLOCK_DESCALE_B_UID = 4
     A_SCALE_UID = 5
     B_SCALE_UID = 6
-    O_UID = 7
+    BIAS_UID = 7
+    O_UID = 8
 
 
 def _check_cudnn_availability():
@@ -1474,6 +1500,109 @@ def _validate_fp8_output_dtype(dtype: torch.dtype):
             f"Unsupported output dtype: {dtype}. "
             f"Only torch.bfloat16 and torch.float16 are supported for FP8 GEMM operations."
         )
+
+
+@functools.cache
+def build_cudnn_gemm_fused_sigmoid_bias_graph(
+    a_shape,
+    b_shape,
+    bias_shape,
+    out_shape,
+    a_type,
+    b_type,
+    bias_type,
+    out_type,
+    a_stride,
+    b_stride,
+    bias_stride,
+    out_stride,
+    device,
+):
+    _check_cudnn_availability()
+    # expand bias_shape and bias_stride to match a_shape and a_stride
+    if bias_shape[0] != a_shape[0]:
+        bias_shape = (a_shape[0], bias_shape[0])
+        bias_stride = (0, bias_stride[0])
+
+    stream = torch.cuda.current_stream(device)
+    with cudnn.graph(_get_cudnn_handle(stream)) as (graph, _):
+        a_cudnn_tensor = graph.tensor(
+            name="a", dim=a_shape, stride=a_stride, data_type=a_type
+        )
+        b_cudnn_tensor = graph.tensor(
+            name="b", dim=b_shape, stride=b_stride, data_type=b_type
+        )
+        bias_cudnn_tensor = graph.tensor(
+            name="bias", dim=bias_shape, stride=bias_stride, data_type=bias_type
+        )
+        out_cudnn_tensor = graph.tensor(
+            name="out", dim=out_shape, stride=out_stride, data_type=out_type
+        )
+        c_cudnn_tensor = graph.matmul(
+            name="matmul",
+            A=a_cudnn_tensor,
+            B=b_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_cudnn_tensor.set_name("c").set_data_type(cudnn.data_type.FLOAT)
+
+        c_after_mm_cudnn_tensor = graph.sigmoid(
+            name="sigmoid",
+            input=c_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_after_mm_cudnn_tensor.set_name("c_after_mm_sigmoid").set_data_type(
+            cudnn.data_type.FLOAT
+        )
+
+        c_after_mm_cudnn_tensor = graph.add(
+            name="add",
+            a=c_after_mm_cudnn_tensor,
+            b=bias_cudnn_tensor,
+            compute_data_type=cudnn.data_type.FLOAT,
+        )
+        c_after_mm_cudnn_tensor.set_name("c_after_mm_sigmoid_add_bias").set_data_type(
+            cudnn.data_type.FLOAT
+        )
+        c_after_mm_cudnn_tensor.set_output(True).set_data_type(out_type)
+
+        a_cudnn_tensor.set_uid(UIDs.A_UID.value)
+        b_cudnn_tensor.set_uid(UIDs.B_UID.value)
+        bias_cudnn_tensor.set_uid(UIDs.BIAS_UID.value)
+        out_cudnn_tensor.set_uid(UIDs.O_UID.value)
+
+        print(graph)
+        graph.validate()
+        graph.build_operation_graph()
+        graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.B])
+
+        return graph
+
+
+def execute_cudnn_gemm_fused_sigmoid_bias_graph(
+    graph,
+    a,
+    b,
+    bias,
+    out,
+    workspace_buffer,
+):
+    variant_pack = {
+        UIDs.A_UID.value: a,
+        UIDs.B_UID.value: b,
+        UIDs.BIAS_UID.value: bias,
+        UIDs.O_UID.value: out,
+    }
+
+    stream = torch.cuda.current_stream(a.device)
+    cudnn_handle = _get_cudnn_handle(stream)
+
+    if workspace_buffer.numel() < graph.get_workspace_size():
+        workspace_buffer = torch.empty(
+            graph.get_workspace_size(), device=a.device, dtype=torch.uint8
+        )
+
+    graph.execute(variant_pack, workspace_buffer, handle=cudnn_handle)
 
 
 @functools.cache
@@ -1831,6 +1960,7 @@ def gemm_fused_sigmoid_bias(
     bias: torch.Tensor,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
+    backend: Literal["cudnn", "cutlass", "cuda"] = "cuda",
 ) -> torch.Tensor:
     r"""Fused Sigmoid and Bias for GEMM
 
@@ -1897,13 +2027,50 @@ def gemm_fused_sigmoid_bias(
         "fused_sigmoid_bias_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
-    get_small_gemm_fused_sigmoid_bias_module().small_gemm_fused_sigmoid_bias(
-        a,
-        b.T,
-        bias,
-        out,
-        workspace_buffer,
-    )
+    if backend == "cutlass":
+        get_small_gemm_fused_sigmoid_bias_cutlass_module().small_gemm_fused_sigmoid_bias(
+            a,
+            b.T,
+            bias,
+            out,
+            workspace_buffer,
+        )
+    elif backend == "cuda":
+        torch.matmul(a, b, out=out)
+        torch.sigmoid_(out)
+        out.add_(bias)
+    elif backend == "cudnn":
+        _check_cudnn_availability()
+
+        graph = build_cudnn_gemm_fused_sigmoid_bias_graph(
+            a.shape,
+            b.shape,
+            bias.shape,
+            out.shape,
+            a.dtype,
+            b.dtype,
+            bias.dtype,
+            out.dtype,
+            a.stride(),
+            b.stride(),
+            bias.stride(),
+            out.stride(),
+            a.device,
+        )
+
+        execute_cudnn_gemm_fused_sigmoid_bias_graph(
+            graph,
+            a,
+            b,
+            bias,
+            out,
+            workspace_buffer,
+        )
+        return out
+    else:
+        raise ValueError(
+            f"Unsupported backend: {backend}. Only cudnn, cutlass and cuda are supported for fused sigmoid bias."
+        )
 
     return out
 
