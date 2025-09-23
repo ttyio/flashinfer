@@ -374,7 +374,11 @@ def gen_small_gemm_fused_sigmoid_bias_cutlass_module() -> JitSpec:
 @functools.cache
 def get_small_gemm_fused_sigmoid_bias_cutlass_module():
     mod = gen_small_gemm_fused_sigmoid_bias_cutlass_module().build_and_load()
-    return mod
+    return _create_cutlass_bf16_gemm_sigmoid_bias_module(
+        mod,
+        "small_gemm_fused_sigmoid_bias_cutlass",
+        "small_gemm_fused_sigmoid_bias_cutlass",
+    )
 
 
 def gen_gemm_sm100_module() -> JitSpec:
@@ -1954,6 +1958,90 @@ def _expand_block_scale_tensor_shape(block_scale_tensor, batch_size):
     return (tuple(block_scale_shape), tuple(block_scale_stride))
 
 
+def _create_cutlass_bf16_gemm_sigmoid_bias_module(
+    module, op_name: str, tuner_name: str
+):
+    """Helper function to create cutlass BF16 sigmoid bias GEMM module."""
+
+    class CutlassBF16GemmSigmoidBiasRunner(TunableRunner):
+        def __init__(self):
+            self._runner = module.small_gemm_fused_sigmoid_bias
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+        ) -> List[int]:
+            return list(range(module.small_gemm_fused_sigmoid_bias_tactic_num()))
+
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            tactic: int = -1,
+            do_preparation: bool = False,
+            **kwargs,
+        ):
+            a, b, bias, out, workspace_buffer = inputs
+            module.small_gemm_fused_sigmoid_bias.default(
+                a, b, bias, out, workspace_buffer, tactic
+            )
+            return out
+
+    @register_custom_op(
+        op_name,
+        mutates_args=(""),
+    )
+    def gemm_fused_sigmoid_bias(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        bias: torch.Tensor,
+        out: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+    ):
+        tuner = AutoTuner.get()
+
+        a_tensor_index = 0
+        bias_tensor_index = 2
+        out_tensor_index = 3
+
+        tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    (a_tensor_index,),
+                    (0,),
+                    get_last_power_of_2_num_tokens_buckets,
+                    last_positive_power_of_2,
+                ),
+            ),
+            constraint_specs=(
+                ConstraintSpec(
+                    bias_tensor_index,
+                    0,
+                    lambda shapes: shapes[a_tensor_index][0],
+                ),
+                ConstraintSpec(
+                    out_tensor_index, 0, lambda shapes: shapes[a_tensor_index][0]
+                ),
+            ),
+        )
+
+        runner = CutlassBF16GemmSigmoidBiasRunner()
+
+        inputs = [a, b, bias, out, workspace_buffer]
+        _, tactic = tuner.choose_one(
+            tuner_name,
+            [runner],
+            tuning_config,
+            inputs,
+        )
+
+        runner(inputs=inputs, tactic=tactic)
+
+    return SimpleNamespace(
+        gemm_fused_sigmoid_bias=gemm_fused_sigmoid_bias,
+    )
+
+
 def gemm_fused_sigmoid_bias(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2028,7 +2116,7 @@ def gemm_fused_sigmoid_bias(
     )
 
     if backend == "cutlass":
-        get_small_gemm_fused_sigmoid_bias_cutlass_module().small_gemm_fused_sigmoid_bias(
+        get_small_gemm_fused_sigmoid_bias_cutlass_module().gemm_fused_sigmoid_bias(
             a,
             b.T,
             bias,
@@ -2036,9 +2124,13 @@ def gemm_fused_sigmoid_bias(
             workspace_buffer,
         )
     elif backend == "cuda":
-        torch.matmul(a, b, out=out)
-        torch.sigmoid_(out)
-        out.add_(bias)
+        get_small_gemm_fused_sigmoid_bias_module().small_gemm_fused_sigmoid_bias(
+            a,
+            b.T,
+            bias,
+            out,
+            workspace_buffer,
+        )
     elif backend == "cudnn":
         _check_cudnn_availability()
 

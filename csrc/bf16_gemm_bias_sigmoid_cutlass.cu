@@ -176,13 +176,39 @@ size_t genericBf16GemmSigmoidBiasLauncher(void const* A, void const* B, void* D,
   return requiredWorkspaceSize;
 }
 
+using BF16GemmKernelFn = size_t (*)(void const*, void const*, void*, void const*, int32_t, int32_t,
+                                    int32_t, void*, size_t, cudaStream_t);
+
+static BF16GemmKernelFn gKernels[] = {
+    &genericBf16GemmSigmoidBiasLauncher<64, 256, 128, 1, 1, 1, _1SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 256, 128, 1, 2, 1, _1SM>,
+    &genericBf16GemmSigmoidBiasLauncher<128, 64, 128, 1, 1, 1, _1SM>,
+    &genericBf16GemmSigmoidBiasLauncher<128, 64, 128, 1, 2, 1, _1SM>,
+    &genericBf16GemmSigmoidBiasLauncher<32, 256, 128, 2, 1, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<32, 128, 128, 2, 2, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<32, 128, 256, 2, 2, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 64, 128, 2, 1, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 64, 128, 2, 2, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 128, 256, 2, 1, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 128, 256, 2, 2, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 256, 128, 2, 1, 1, _2SM>,
+    &genericBf16GemmSigmoidBiasLauncher<64, 256, 128, 2, 2, 1, _2SM>,
+};
+
 at::Tensor small_gemm_fused_sigmoid_bias_impl(at::Tensor const& A, at::Tensor const& B,
                                               at::Tensor const& bias, at::Tensor out,
-                                              at::Tensor workspace_buffer) {
+                                              at::Tensor workspace_buffer, int64_t tactic) {
   CHECK_INPUT_AND_TYPE(A, at::ScalarType::BFloat16);
   CHECK_INPUT_AND_TYPE(B, at::ScalarType::BFloat16);
   CHECK_INPUT_AND_TYPE(bias, at::ScalarType::BFloat16);
   CHECK_INPUT_AND_TYPE(out, at::ScalarType::BFloat16);
+
+  if (tactic == -1) {
+    tactic = 0;
+  }
+  if (tactic >= sizeof(gKernels) / sizeof(gKernels[0])) {
+    throw std::runtime_error("Invalid tactic");
+  }
 
   int32_t M = A.size(0);
   int32_t K = A.size(1);
@@ -192,14 +218,13 @@ at::Tensor small_gemm_fused_sigmoid_bias_impl(at::Tensor const& A, at::Tensor co
 
   int64_t const provided_workspace_size =
       workspace_buffer.numel() * workspace_buffer.element_size();
-  size_t required_workspace_size = genericBf16GemmSigmoidBiasLauncher<64, 256, 128, 1, 1, 1, _1SM>(
-      A.const_data_ptr(), B.const_data_ptr(), out.data_ptr(), bias.const_data_ptr(), M, N, K,
-      nullptr, 0, stream);
+  size_t required_workspace_size =
+      gKernels[tactic](A.const_data_ptr(), B.const_data_ptr(), out.data_ptr(),
+                       bias.const_data_ptr(), M, N, K, nullptr, 0, stream);
 
   auto runKernel = [&](void* workspace) {
-    genericBf16GemmSigmoidBiasLauncher<128, 64, 128, 2, 1, 1, _2SM>(
-        A.const_data_ptr(), B.const_data_ptr(), out.data_ptr(), bias.const_data_ptr(), M, N, K,
-        workspace, required_workspace_size, stream);
+    gKernels[tactic](A.const_data_ptr(), B.const_data_ptr(), out.data_ptr(), bias.const_data_ptr(),
+                     M, N, K, workspace, required_workspace_size, stream);
   };
 
   if (required_workspace_size > provided_workspace_size) {
@@ -213,8 +238,14 @@ at::Tensor small_gemm_fused_sigmoid_bias_impl(at::Tensor const& A, at::Tensor co
   return out;
 }
 
+int64_t small_gemm_fused_sigmoid_bias_tactic_num() {
+  return sizeof(gKernels) / sizeof(gKernels[0]);
+}
+
 }  // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(TORCH_EXTENSION_NAME, m) {
   m.def("small_gemm_fused_sigmoid_bias", &torch_ext::small_gemm_fused_sigmoid_bias_impl);
+  m.def("small_gemm_fused_sigmoid_bias_tactic_num",
+        &torch_ext::small_gemm_fused_sigmoid_bias_tactic_num);
 }
